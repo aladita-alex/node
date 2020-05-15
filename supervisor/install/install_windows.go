@@ -17,9 +17,76 @@
 
 package install
 
-import "errors"
+import (
+	"errors"
+	"time"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
+)
+
+var ErrManagerAlreadyRunning = errors.New("manager already installed and running")
+var cachedServiceManager *mgr.Mgr
+
+func serviceManager() (*mgr.Mgr, error) {
+	if cachedServiceManager != nil {
+		return cachedServiceManager, nil
+	}
+	m, err := mgr.Connect()
+	if err != nil {
+		return nil, err
+	}
+	cachedServiceManager = m
+	return cachedServiceManager, nil
+}
 
 // Install installs service for linux. Not implemented yet.
 func Install(options Options) error {
-	return errors.New("not implemented")
+	m, err := serviceManager()
+	if err != nil {
+		return err
+	}
+	// TODO: Do we want to bail if executable isn't being run from the right location?
+
+	serviceName := "MystSupervisor"
+	service, err := m.OpenService(serviceName)
+	if err == nil {
+		status, err := service.Query()
+		if err != nil {
+			service.Close()
+			return err
+		}
+		if status.State != svc.Stopped {
+			service.Close()
+			return ErrManagerAlreadyRunning
+		}
+		err = service.Delete()
+		service.Close()
+		if err != nil {
+			return err
+		}
+		for {
+			service, err = m.OpenService(serviceName)
+			if err != nil {
+				break
+			}
+			service.Close()
+			time.Sleep(time.Second / 3)
+		}
+	}
+
+	config := mgr.Config{
+		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
+		StartType:    mgr.StartAutomatic,
+		ErrorControl: mgr.ErrorNormal,
+		DisplayName:  "MystSupervisor Service",
+	}
+
+	service, err = m.CreateService(serviceName, options.SupervisorPath, config, "")
+	if err != nil {
+		return err
+	}
+	service.Start()
+	return service.Close()
 }
