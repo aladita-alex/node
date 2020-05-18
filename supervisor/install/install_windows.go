@@ -18,75 +18,87 @@
 package install
 
 import (
-	"errors"
-	"time"
+	"fmt"
+	"log"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
-var ErrManagerAlreadyRunning = errors.New("manager already installed and running")
-var cachedServiceManager *mgr.Mgr
+const serviceName = "MystSupervisor"
 
-func serviceManager() (*mgr.Mgr, error) {
-	if cachedServiceManager != nil {
-		return cachedServiceManager, nil
-	}
-	m, err := mgr.Connect()
-	if err != nil {
-		return nil, err
-	}
-	cachedServiceManager = m
-	return cachedServiceManager, nil
-}
-
-// Install installs service for linux. Not implemented yet.
+// Install installs service for Windows.
 func Install(options Options) error {
-	m, err := serviceManager()
+	m, err := mgr.Connect()
 	if err != nil {
 		return err
 	}
-	// TODO: Do we want to bail if executable isn't being run from the right location?
-
-	serviceName := "MystSupervisor"
-	service, err := m.OpenService(serviceName)
-	if err == nil {
-		status, err := service.Query()
-		if err != nil {
-			service.Close()
-			return err
-		}
-		if status.State != svc.Stopped {
-			service.Close()
-			return ErrManagerAlreadyRunning
-		}
-		err = service.Delete()
-		service.Close()
-		if err != nil {
-			return err
-		}
-		for {
-			service, err = m.OpenService(serviceName)
-			if err != nil {
-				break
-			}
-			service.Close()
-			time.Sleep(time.Second / 3)
-		}
-	}
+	defer m.Disconnect()
 
 	config := mgr.Config{
 		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
 		StartType:    mgr.StartAutomatic,
 		ErrorControl: mgr.ErrorNormal,
 		DisplayName:  "MystSupervisor Service",
+		Description:  "Mysterium Network dApp supervisor service is responsible for manages network configurations",
 	}
 
-	service, err = m.CreateService(serviceName, options.SupervisorPath, config, "")
+	if err := uninstallService(m, serviceName); err != nil {
+		log.Printf("Failed to remove service: %v", err)
+	}
+
+	if err := installAndStartService(m, serviceName, options.SupervisorPath, config); err != nil {
+		return fmt.Errorf("could not install and run service: %w", err)
+	}
+	return nil
+}
+
+func installAndStartService(m *mgr.Mgr, name, exePath string, config mgr.Config) error {
+	s, err := m.OpenService(name)
+	if err == nil {
+		s.Close()
+		return fmt.Errorf("service %s already exists", name)
+	}
+
+	s, err = m.CreateService(name, exePath, config)
 	if err != nil {
 		return err
 	}
-	service.Start()
-	return service.Close()
+	defer s.Close()
+	err = eventlog.Remove(name)
+	err = eventlog.InstallAsEventCreate(name, eventlog.Error|eventlog.Warning|eventlog.Info)
+	if err != nil {
+		s.Delete()
+		return fmt.Errorf("SetupEventLogSource() failed: %s", err)
+	}
+	if err := s.Start(); err != nil {
+		return fmt.Errorf("could not start service: %w", err)
+	}
+	return nil
+}
+
+func uninstallService(m *mgr.Mgr, name string) error {
+	s, err := m.OpenService(name)
+	if err != nil {
+		return fmt.Errorf("service %s is not installed", name)
+	}
+	defer s.Close()
+	log.Println("Detected previously installed service, uninstalling...")
+
+	s.Control(svc.Stop)
+	err = s.Delete()
+	err2 := s.Close()
+	if err != nil {
+		return fmt.Errorf("could not delete service: %w", err)
+	}
+	if err2 != nil {
+		return fmt.Errorf("could not close service handle: %w", err)
+	}
+	err = eventlog.Remove(name)
+	if err != nil {
+		return fmt.Errorf("RemoveEventLogSource() failed: %s", err)
+	}
+	return nil
 }
