@@ -20,6 +20,7 @@ package transport
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/Microsoft/go-winio"
 	"golang.org/x/sys/windows/svc"
@@ -67,9 +68,24 @@ func (m *managerService) Execute(args []string, r <-chan svc.ChangeRequest, s ch
 }
 
 func (m *managerService) listenPipe() error {
-	l, err := winio.ListenPipe(sock, &winio.PipeConfig{
-		SecurityDescriptor: "",
-	})
+	// Allow Administrators and SYSTEM, plus whatever additional users or groups are specified.
+	socketGroup := "Users"
+	sddl := "D:P(A;;GA;;;BA)(A;;GA;;;SY)"
+	for _, g := range strings.Split(socketGroup, ",") {
+		sid, err := winio.LookupSidByName(g)
+		if err != nil {
+			return err
+		}
+		sddl += fmt.Sprintf("(A;;GRGW;;;%s)", sid)
+	}
+	c := winio.PipeConfig{
+		SecurityDescriptor: sddl,
+		MessageMode:        true,  // Use message mode so that CloseWrite() is supported.
+		InputBufferSize:    65536, // Use 64KB buffers to improve performance.
+		OutputBufferSize:   65536,
+	}
+
+	l, err := winio.ListenPipe(sock, &c)
 	if err != nil {
 		return fmt.Errorf("error listening: %w", err)
 	}
